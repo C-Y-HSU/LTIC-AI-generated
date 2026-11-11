@@ -122,7 +122,7 @@ if submit_btn:
     if not bed_num.strip() or not name.strip() or not clinical_note.strip():
         st.error("請務必完整填寫：床號、住民姓名以及護理病程經過！")
     else:
-        with st.spinner("感染管制專家引擎分析中，比對指引中..."):
+        with st.spinner("感染管制專家引擎分析中，正在比對感管指引..."):
             prompt_content = f"""
             住民資訊：
             - 床號：{bed_num}
@@ -136,45 +136,57 @@ if submit_btn:
             """
             
             try:
-                response = model.generate_content(prompt_content)
-                cleaned_text = response.text.replace("```json", "").replace("```", "").strip()
-                result = json.loads(cleaned_text)
+                # 啟用結構化 JSON 強制輸出，避免模型輸出 Markdown 標籤干擾解析
+                response = model.generate_content(
+                    prompt_content,
+                    generation_config={"response_mime_type": "application/json"}
+                )
+                
+                raw_text = response.text.strip()
+                
+                # 自動清理可能的 Markdown 標記
+                if raw_text.startswith("```"):
+                    raw_text = raw_text.strip("`")
+                    if raw_text.startswith("json"):
+                        raw_text = raw_text[4:].strip()
+
+                result = json.loads(raw_text)
                 
                 # 畫面結果展示
                 st.divider()
-                if result["is_case"]:
-                    st.error(f"🚨 【符合收案條件】感染分類：{result['case_type']}")
+                if result.get("is_case"):
+                    st.error(f"🚨 【符合收案條件】感染分類：{result.get('case_type', '未分類')}")
                 else:
-                    st.info(f"📋 【未符合收案標準】原因類別：{result['case_type']}")
+                    st.info(f"📋 【未符合收案標準】原因類別：{result.get('case_type', '不收案')}")
                 
                 st.markdown(f"**照護相關判定：** {'機構內感染' if result.get('is_healthcare_associated') else '非機構照護所致／院外帶入'}")
                 st.markdown(f"**審核與推理依據：**\n{result.get('detailed_reasoning')}")
                 st.warning(f"**建議防護措施：**\n{result.get('recommended_actions')}")
                 
                 # 寫入 Google Sheets (Surveillance_Logs)
-                log_entry = [
-                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    bed_num,
-                    name,
-                    catheter_status,
-                    has_recent_adm,
-                    str(onset_date),
-                    body_temp,
-                    ", ".join(symptoms),
-                    clinical_note,
-                    "收案" if result["is_case"] else "不收案",
-                    result.get("case_type", "未分類"),
-                    "是" if result.get("is_healthcare_associated") else "否",
-                    result.get("detailed_reasoning", ""),
-                    result.get("recommended_actions", ""),
-                    "待複核"
-                ]
-                
-                sheet_logs.append_row(log_entry)
-                st.success("✅ 通報記錄與判定結果已成功同步存入 Google 試算表！")
+                with st.spinner("正在同步寫入 Google 試算表資料庫..."):
+                    log_entry = [
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        bed_num,
+                        name,
+                        catheter_status,
+                        has_recent_adm,
+                        str(onset_date),
+                        body_temp,
+                        ", ".join(symptoms),
+                        clinical_note,
+                        "收案" if result.get("is_case") else "不收案",
+                        result.get("case_type", "未分類"),
+                        "是" if result.get("is_healthcare_associated") else "否",
+                        result.get("detailed_reasoning", ""),
+                        result.get("recommended_actions", ""),
+                        "待複核"
+                    ]
+                    sheet_logs.append_row(log_entry)
+                    st.success("✅ 通報記錄與判定結果已成功同步存入 Google 試算表！")
                 
             except json.JSONDecodeError:
-                st.error("AI 輸出解析失敗，原始回傳如下：")
-                st.text(response.text)
+                st.error("JSON 格式轉換失敗，模型原始輸出內容如下：")
+                st.code(response.text)
             except Exception as e:
-                st.error(f"存檔或執行過程發生錯誤：{e}")
+                st.error(f"執行或寫入試算表時發生錯誤：{e}")
