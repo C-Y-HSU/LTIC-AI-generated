@@ -126,75 +126,100 @@ with col_right:
 
 submit_btn = st.button("送出並執行感管收案審核", type="primary", use_container_width=True)
 
-# ==================== 3. 判定與存檔 ====================
+# ==================== 3. 判定與存檔（加入動態進度條） ====================
 if submit_btn:
     if not bed_num.strip() or not name.strip() or not clinical_note.strip():
         st.error("請務必完整填寫：床號、住民姓名以及護理病程經過！")
     else:
-        with st.spinner("感染管制專家引擎分析中，正在比對感管指引..."):
-            prompt_content = f"""
-            住民資訊：
-            - 床號：{bed_num}
-            - 姓名：{name}
-            - 導尿管留置狀態：{catheter_status}
-            - 近期出入院狀況：{has_recent_adm}
-            - 症狀發生日：{onset_date}
-            - 體溫：{body_temp} ℃
-            - 勾選症狀：{", ".join(symptoms) if symptoms else "未特別勾選，詳見病程"}
-            - 護理病程記錄：{clinical_note}
-            """
-            
-            try:
-                response = model.generate_content(
-                    prompt_content,
-                    generation_config={"response_mime_type": "application/json"}
-                )
-                
-                raw_text = response.text.strip()
-                if raw_text.startswith("```"):
-                    raw_text = raw_text.strip("`")
-                    if raw_text.startswith("json"):
-                        raw_text = raw_text[4:].strip()
+        # 建立進度條元件與狀態文字容器
+        progress_bar = st.progress(0)
+        status_text = st.empty()
 
-                result = json.loads(raw_text)
-                
-                # 畫面結果展示
-                st.divider()
-                if result.get("is_case"):
-                    st.error(f"🚨 【符合收案條件】感染分類：{result.get('case_type', '未分類')}")
-                else:
-                    st.info(f"📋 【未符合收案標準】原因類別：{result.get('case_type', '不收案')}")
-                
-                st.markdown(f"**照護相關判定：** {'機構內感染' if result.get('is_healthcare_associated') else '非機構照護所致／院外帶入'}")
-                st.markdown(f"**審核與推理依據：**\n{result.get('detailed_reasoning')}")
-                
-                st.subheader("📋 護理端感管防護與臨床處置指引")
-                st.warning(result.get('recommended_actions'))
-                
-                # 寫入 Google Sheets (Surveillance_Logs)
-                with st.spinner("正在同步寫入 Google 試算表資料庫..."):
-                    log_entry = [
-                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        bed_num,
-                        name,
-                        catheter_status,
-                        has_recent_adm,
-                        str(onset_date),
-                        body_temp,
-                        ", ".join(symptoms),
-                        clinical_note,
-                        "收案" if result.get("is_case") else "不收案",
-                        result.get("case_type", "未分類"),
-                        "是" if result.get("is_healthcare_associated") else "否",
-                        result.get("detailed_reasoning", ""),
-                        result.get("recommended_actions", ""),
-                        "待複核"
-                    ]
-                    sheet_logs.append_row(log_entry)
-                    st.success("✅ 通報記錄與判定結果已成功同步存入 Google 試算表！")
-                
-            except json.JSONDecodeError:
-                st.error("JSON 格式轉換失敗，模型原始輸出內容如下：")
-                st.code(response.text)
-            except Exception as e:
-                st.error(f"執行或寫入試算表時發生錯誤：{e}")
+        prompt_content = f"""
+        住民資訊：
+        - 床號：{bed_num}
+        - 姓名：{name}
+        - 導尿管留置狀態：{catheter_status}
+        - 近期出入院狀況：{has_recent_adm}
+        - 症狀發生日：{onset_date}
+        - 體溫：{body_temp} ℃
+        - 勾選症狀：{", ".join(symptoms) if symptoms else "未特別勾選，詳見病程"}
+        - 護理病程記錄：{clinical_note}
+        """
+
+        try:
+            # 階段 1：組裝通報資料
+            status_text.info("【1/4】整理通報資訊與時序資料...")
+            progress_bar.progress(25)
+
+            # 階段 2：呼叫 Gemini API 進行感管審核
+            status_text.info("【2/4】感管 AI 引擎審核中：比對潛伏期、時序性與排除非感染病理...")
+            progress_bar.progress(50)
+
+            response = model.generate_content(
+                prompt_content,
+                generation_config={"response_mime_type": "application/json"}
+            )
+
+            raw_text = response.text.strip()
+            if raw_text.startswith("```"):
+                raw_text = raw_text.strip("`")
+                if raw_text.startswith("json"):
+                    raw_text = raw_text[4:].strip()
+
+            result = json.loads(raw_text)
+
+            # 階段 3：解析判定結果
+            status_text.info("【3/4】審核完成，解析判定條款與護理處置指引...")
+            progress_bar.progress(75)
+
+            # 階段 4：寫入 Google Sheets
+            status_text.info("【4/4】正在同步存入 Google 雲端試算表資料庫...")
+            log_entry = [
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                bed_num,
+                name,
+                catheter_status,
+                has_recent_adm,
+                str(onset_date),
+                body_temp,
+                ", ".join(symptoms),
+                clinical_note,
+                "收案" if result.get("is_case") else "不收案",
+                result.get("case_type", "未分類"),
+                "是" if result.get("is_healthcare_associated") else "否",
+                result.get("detailed_reasoning", ""),
+                result.get("recommended_actions", ""),
+                "待複核"
+            ]
+            sheet_logs.append_row(log_entry)
+
+            # 完成：進度條拉滿並清除過渡提示
+            progress_bar.progress(100)
+            status_text.empty()
+            progress_bar.empty()  # 完成後可自動隱藏進度條
+
+            # 畫面結果展示
+            st.divider()
+            if result.get("is_case"):
+                st.error(f"🚨 【符合收案條件】感染分類：{result.get('case_type', '未分類')}")
+            else:
+                st.info(f"📋 【未符合收案標準】原因類別：{result.get('case_type', '不收案')}")
+
+            st.markdown(f"**照護相關判定：** {'機構內感染' if result.get('is_healthcare_associated') else '非機構照護所致／院外帶入'}")
+            st.markdown(f"**審核與推理依據：**\n{result.get('detailed_reasoning')}")
+
+            st.subheader("📋 護理端感管防護與臨床處置指引")
+            st.warning(result.get('recommended_actions'))
+
+            st.success("✅ 通報記錄與判定結果已成功同步存入 Google 試算表！")
+
+        except json.JSONDecodeError:
+            status_text.empty()
+            progress_bar.empty()
+            st.error("JSON 格式轉換失敗，模型原始輸出內容如下：")
+            st.code(response.text)
+        except Exception as e:
+            status_text.empty()
+            progress_bar.empty()
+            st.error(f"執行或寫入試算表時發生錯誤：{e}")
