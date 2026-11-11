@@ -2,7 +2,6 @@ import streamlit as st
 import google.generativeai as genai
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-import pandas as pd
 import json
 from datetime import datetime
 
@@ -12,7 +11,6 @@ st.set_page_config(page_title="長照機構感管監測系統", layout="wide", p
 # ==================== 連線與 API 設定 ====================
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
-SYSTEM_INSTRUCTION = """
 SYSTEM_INSTRUCTION = """
 你是一位嚴謹的長期照護機構感染管制專家 (Infection Control Officer)。
 機構現場常態「僅有護理人員與照服員執勤，無常駐醫師」。
@@ -31,19 +29,10 @@ SYSTEM_INSTRUCTION = """
 
 【機構端建議處置生成規範（護理與照服端可行性）】
 嚴禁產出「醫師開立抗生素/處方」、「進行侵入性手術」等醫療端指令。處置建議必須精準落實於以下四個面向：
-1. 防護措施與空間隔離：
-   - 標準防護、接觸隔離或飛沫隔離。
-   - 床位處置（如拉上隔簾、暫停跨區活動、同寢室住民同質或分區照護、調至最後照護順序）。
-2. 護理技術與臨床處置：
-   - 呼吸道：姿位引流、翻身拍背、抽痰維持呼吸道暢通、給氧支持（如 O2 Cannula）。
-   - 泌尿道：嚴格無菌技術重置導尿管、落實密閉式引流、尿袋嚴禁高於膀胱、加強會陰沖洗 (CDO)。
-   - 腸胃道/皮膚：暫停公費或共用餐具、加強稀釋漂白水環境清消、傷口分泌物無菌換藥包紮。
-3. 監測與機構內快速篩檢：
-   - 監測生命徵象（如 q4h BP/PR/RR/SpO2/耳溫）、I/O 尿量性狀紀錄。
-   - 機構內即時篩檢（尿液試紙檢驗 Dipstick、COVID-19/流感抗原快篩）。
-4. 醫療通報與外送標準：
-   - 記錄異常數值聯絡特約責任醫療院所/特約醫師評估。
-   - 設定送醫警訊（如 GCS 意識驟降、SpO2<90% 氧氣無法改善、高燒寒顫休克徵兆即啟動 119 送醫）。
+1. 防護措施與空間隔離：標準防護/飛沫/接觸隔離、床位隔簾處置、暫停跨區活動、調整為該寢室最後照護順序。
+2. 護理技術與臨床處置：姿位引流拍背抽痰、給氧支持、嚴格無菌技術重置導尿管、尿袋維持低於膀胱、加強會陰沖洗 (CDO)、無菌換藥、稀釋漂白水環境清消。
+3. 監測與機構內快速篩檢：q4h 生命徵象（耳溫/BP/PR/RR/SpO2）、I/O 尿量性狀記錄、尿液試紙 (Dipstick) 篩檢、COVID-19/流感快篩。
+4. 醫療通報與外送標準：記錄異常數值聯絡特約醫療院所/特約醫師；若出現危急徵候（GCS驟降、SpO2<90% 氧氣無法改善、發紺休克）即啟動 119 送醫。
 
 【輸出規範】
 嚴格輸出純合法 JSON，格式如下：
@@ -52,12 +41,12 @@ SYSTEM_INSTRUCTION = """
   "case_type": "呼吸道感染-肺炎" | "呼吸道感染-類流感" | "呼吸道感染-下呼吸道" | "呼吸道感染-感冒咽喉炎" | "泌尿道感染-有導尿管" | "泌尿道感染-無導尿管" | "腸胃道感染" | "皮膚軟組織感染" | "疥瘡" | "眼耳鼻口感染" | "血流感染" | "無法解釋發燒" | "不收案",
   "is_healthcare_associated": true 或 false,
   "detailed_reasoning": "說明時序與照護相關性、非感染因素排除情況、符合與未符合的指引條款。",
-  "recommended_actions": "條列護理端具體處置：1. 感管防護與隔離；2. 護理照護措施；3. 機構內檢驗與生命徵象監測；4. 責任醫院/特約醫師通報與轉送條件。"
+  "recommended_actions": "條列護理端具體處置：1. 感管防護與空間隔離；2. 護理臨床處置；3. 監測與機構內檢驗；4. 責任醫療通報與外送標準。"
 }
 """
 
 model = genai.GenerativeModel(
-    model_name="gemini-3.8-flash",
+    model_name="gemini-2.5-flash",
     system_instruction=SYSTEM_INSTRUCTION
 )
 
@@ -156,15 +145,12 @@ if submit_btn:
             """
             
             try:
-                # 啟用結構化 JSON 強制輸出，避免模型輸出 Markdown 標籤干擾解析
                 response = model.generate_content(
                     prompt_content,
                     generation_config={"response_mime_type": "application/json"}
                 )
                 
                 raw_text = response.text.strip()
-                
-                # 自動清理可能的 Markdown 標記
                 if raw_text.startswith("```"):
                     raw_text = raw_text.strip("`")
                     if raw_text.startswith("json"):
@@ -181,7 +167,9 @@ if submit_btn:
                 
                 st.markdown(f"**照護相關判定：** {'機構內感染' if result.get('is_healthcare_associated') else '非機構照護所致／院外帶入'}")
                 st.markdown(f"**審核與推理依據：**\n{result.get('detailed_reasoning')}")
-                st.warning(f"**建議防護措施：**\n{result.get('recommended_actions')}")
+                
+                st.subheader("📋 護理端感管防護與臨床處置指引")
+                st.warning(result.get('recommended_actions'))
                 
                 # 寫入 Google Sheets (Surveillance_Logs)
                 with st.spinner("正在同步寫入 Google 試算表資料庫..."):
