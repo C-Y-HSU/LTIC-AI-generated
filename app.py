@@ -211,21 +211,66 @@ if submit_btn:
             # 完成：進度條拉滿並清除過渡提示
             progress_bar.progress(100)
             status_text.empty()
-            progress_bar.empty()  # 完成後可自動隱藏進度條
+            progress_bar.empty()
 
-            # 畫面結果展示
+            # 畫面結果展示（依收案與否分流顯示）
             st.divider()
-            if result.get("is_case"):
+            is_case = result.get("is_case", False)
+
+            if is_case:
                 st.error(f"🚨 【符合收案條件】感染分類：{result.get('case_type', '未分類')}")
+                st.markdown(f"**照護相關判定：** {'機構內感染' if result.get('is_healthcare_associated') else '非機構照護所致／院外帶入'}")
+                st.markdown(f"**審核條款摘要：**\n{result.get('detailed_reasoning', '')}")
+
+                col_cause, col_care = st.columns(2, gap="medium")
+                with col_cause:
+                    st.subheader("🔍 5 個可能感染原因")
+                    causes = result.get("possible_causes", [])
+                    if causes:
+                        for idx, cause in enumerate(causes, 1):
+                            st.markdown(f"**{idx}.** {cause}")
+                    else:
+                        st.write("無額外列出原因")
+
+                with col_care:
+                    st.subheader("📋 機構護理端可執行措施")
+                    st.warning(result.get("nursing_measures", "請依機構感管標準作業程序執行隔離與監測。"))
+
+                # 組合寫入試算表的文字欄位
+                sheet_reasoning = result.get("detailed_reasoning", "") + "\n\n【可能感染原因】\n" + "\n".join(causes)
+                sheet_actions = result.get("nursing_measures", "")
+
             else:
-                st.info(f"📋 【未符合收案標準】原因類別：{result.get('case_type', '不收案')}")
+                st.info("📋 【未符合收案標準】判定結果：不收案")
+                st.markdown(f"**照護相關判定：** {'機構內感染（未達定義門檻）' if result.get('is_healthcare_associated') else '非機構照護所致／院外帶入'}")
+                
+                st.subheader("❌ 不收案原因說明")
+                non_acc_reason = result.get("non_acceptance_reason") or result.get("detailed_reasoning", "")
+                st.success(non_acc_reason)
 
-            st.markdown(f"**照護相關判定：** {'機構內感染' if result.get('is_healthcare_associated') else '非機構照護所致／院外帶入'}")
-            st.markdown(f"**審核與推理依據：**\n{result.get('detailed_reasoning')}")
+                # 組合寫入試算表的文字欄位
+                sheet_reasoning = non_acc_reason
+                sheet_actions = "不收案（維持常規照護與症狀觀察）"
 
-            st.subheader("📋 護理端感管防護與臨床處置指引")
-            st.warning(result.get('recommended_actions'))
-
+            # 寫入 Google Sheets (Surveillance_Logs，維持原有 15 欄對應)
+            log_entry = [
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                bed_num,
+                name,
+                catheter_status,
+                has_recent_adm,
+                str(onset_date),
+                body_temp,
+                ", ".join(symptoms),
+                clinical_note,
+                "收案" if is_case else "不收案",
+                result.get("case_type", "不收案") if is_case else "不收案",
+                "是" if result.get("is_healthcare_associated") else "否",
+                sheet_reasoning,
+                sheet_actions,
+                "待複核"
+            ]
+            sheet_logs.append_row(log_entry)
             st.success("✅ 通報記錄與判定結果已成功同步存入 Google 試算表！")
 
         except json.JSONDecodeError:
