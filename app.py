@@ -16,6 +16,10 @@ if "current_row_idx" not in st.session_state:
     st.session_state.current_row_idx = None
 if "base_payload" not in st.session_state:
     st.session_state.base_payload = None
+if "skip_db_sync" not in st.session_state:
+    st.session_state.skip_db_sync = False  # 標記是否因雲端壅塞而改為「僅介面呈現」
+if "last_supplemental" not in st.session_state:
+    st.session_state.last_supplemental = ""
 
 # ==================== 連線與 API 設定 ====================
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
@@ -78,9 +82,13 @@ SYSTEM_INSTRUCTION = """
 }
 """
 
-# 採用 gemini-3.8-flash 作為主力高精準度感管推理模型
 model = genai.GenerativeModel(
     model_name="gemini-3.8-flash",
+    system_instruction=SYSTEM_INSTRUCTION
+)
+
+fallback_model = genai.GenerativeModel(
+    model_name="gemini-3.5-flash-lite",
     system_instruction=SYSTEM_INSTRUCTION
 )
 
@@ -100,33 +108,52 @@ except Exception as e:
 
 # ==================== 輔助與防呆函式 ====================
 def ensure_str(val):
-    """防呆輔助函式：確保無論 AI 回傳字串或陣列，都能安全轉為純文字"""
     if isinstance(val, list):
         return "\n".join([str(item) for item in val])
     return str(val) if val is not None else ""
 
-def call_gemini_fast(prompt_text, max_retries=2):
+def call_gemini_with_congestion_check(prompt_text, max_retries=3):
+    """
+    呼叫 Gemini 並回傳 (response, had_congestion)
+    若過程中曾發生 504/503 壅塞重試，had_congestion 會標記為 True，後續自動改為僅介面呈現以減輕連線負擔
+    """
+    had_congestion = False
     for attempt in range(max_retries):
         try:
-            return model.generate_content(
+            resp = model.generate_content(
                 prompt_text,
                 generation_config={
                     "response_mime_type": "application/json",
                     "thinking_config": {"thinking_budget": 0}
                 },
-                request_options={"timeout": 60}
+                request_options={"timeout": 90}
             )
+            return resp, had_congestion
         except Exception as e:
             err_msg = str(e)
             if "thinking_config" in err_msg or "Unknown field" in err_msg:
-                return model.generate_content(
-                    prompt_text,
-                    generation_config={"response_mime_type": "application/json"},
-                    request_options={"timeout": 60}
-                )
-            if "504" in err_msg and attempt < max_retries - 1:
-                time.sleep(2)
-                continue
+                try:
+                    resp = model.generate_content(
+                        prompt_text,
+                        generation_config={"response_mime_type": "application/json"},
+                        request_options={"timeout": 90}
+                    )
+                    return resp, had_congestion
+                except Exception as inner_e:
+                    err_msg = str(inner_e)
+
+            if ("504" in err_msg or "503" in err_msg or "Deadline" in err_msg):
+                had_congestion = True  # 標記雲端發生壅塞
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+                    continue
+                else:
+                    resp = fallback_model.generate_content(
+                        prompt_text,
+                        generation_config={"response_mime_type": "application/json"},
+                        request_options={"timeout": 60}
+                    )
+                    return resp, had_congestion
             raise e
 
 def parse_ai_json(raw_text):
@@ -181,7 +208,6 @@ st.caption("依據長期照護機構感染監測指引進行即時判定與雲�
 
 col_left, col_right = st.columns([1, 1], gap="medium")
 
-# ----- 左欄：基本資料比對與帶入 -----
 with col_left:
     st.subheader("1. 住民基本資料比對")
     search_query = st.text_input("輸入床號或姓名搜尋住民", placeholder="例如：301-1 或 王大明")
@@ -212,7 +238,6 @@ with col_left:
         help="用以判斷是否為潛伏期帶入或原住院之醫療相關感染"
     )
 
-# ----- 右欄：症狀與病程經過 -----
 with col_right:
     st.subheader("2. 症狀與病程經過輸入")
     onset_date = st.date_input("症狀發生日期", datetime.today())
@@ -237,13 +262,18 @@ with col_right:
 
 submit_btn = st.button("送出並執行感管收案審核", type="primary", use_container_width=True)
 
-# ==================== 3. 初次判定與存檔 ====================
+# ==================== 3. 初次判定與智慧分流存檔 ====================
 if submit_btn:
     if not bed_num.strip() or not name.strip() or not clinical_note.strip():
         st.error("請務必完整填寫：床號、住民姓名以及護理病程經過！")
     else:
         progress_bar = st.progress(0)
         status_text = st.empty()
+
+        # 每次新案件送出時重置壅塞標記
+        st.session_state.skip_db_sync = False
+        st.session_state.current_row_idx = None
+        st.session_state.last_supplemental = ""
 
         payload = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -271,9 +301,9 @@ if submit_btn:
 
         try:
             status_text.info("【1/3】感管專家引擎 (Gemini 3.8 Flash) 審核中...")
-            progress_bar.progress(40)
+            progress_bar.progress(45)
 
-            response = call_gemini_fast(prompt_content)
+            response, had_congestion = call_gemini_with_congestion_check(prompt_content)
 
             status_text.info("【2/3】解析審核結果與護理觀察缺漏...")
             progress_bar.progress(80)
@@ -282,16 +312,20 @@ if submit_btn:
 
             st.session_state.audit_result = result
             st.session_state.base_payload = payload
+            st.session_state.skip_db_sync = had_congestion
 
-            status_text.info("【3/3】同步寫入雲端試算表...")
-            log_row = build_log_row(payload, result)
-            sheet_logs.append_row(log_row)
-            
-            st.session_state.current_row_idx = len(sheet_logs.get_all_values())
+            # 只有在「沒有發生雲端壅塞重試」的順暢狀態下，才自動寫入試算表
+            if not had_congestion:
+                status_text.info("【3/3】連線順暢，同步寫入雲端試算表...")
+                log_row = build_log_row(payload, result)
+                sheet_logs.append_row(log_row)
+                st.session_state.current_row_idx = len(sheet_logs.get_all_values())
+                st.toast("✅ 初次審核完成並已存入 Google 試算表！")
+            else:
+                st.toast("⚠️ 偵測到 Google 雲端尖峰壅塞，已啟動「僅介面呈現模式」以減輕連線負擔！")
 
             status_text.empty()
             progress_bar.empty()
-            st.toast("✅ 初次審核完成並已存入 Google 試算表！")
 
         except json.JSONDecodeError:
             status_text.empty()
@@ -301,7 +335,7 @@ if submit_btn:
         except Exception as e:
             status_text.empty()
             progress_bar.empty()
-            st.error(f"執行或寫入試算表時發生錯誤：{e}")
+            st.error(f"執行過程發生錯誤：{e}")
 
 # ==================== 4. 顯示判定結果與「二次補充資料重審區」 ====================
 if st.session_state.audit_result is not None:
@@ -309,6 +343,26 @@ if st.session_state.audit_result is not None:
     is_case = result.get("is_case", False)
 
     st.divider()
+
+    # 若處於「僅介面呈現模式」，顯示明確提醒與手動補存按鈕
+    if st.session_state.skip_db_sync:
+        st.warning("⚠️ **目前為「僅介面呈現模式」**：因偵測到 Google 雲端尖峰壅塞（曾發生 504 逾時重試），為避免資料庫連線負擔與寫入異常，本次與後續二次補件結果將**只呈現在畫面上，不自動寫入 Google 試算表**。")
+        if st.button("📥 網路已恢復順暢，手動將目前這筆結果補存至 Google 試算表", use_container_width=True):
+            try:
+                with st.spinner("正在寫入 Google 試算表..."):
+                    manual_row = build_log_row(
+                        st.session_state.base_payload,
+                        result,
+                        supplemental_text=st.session_state.last_supplemental
+                    )
+                    sheet_logs.append_row(manual_row)
+                    st.session_state.current_row_idx = len(sheet_logs.get_all_values())
+                    st.session_state.skip_db_sync = False
+                    st.success("✅ 已成功手動補存至 Google 試算表！")
+                    st.rerun()
+            except Exception as e:
+                st.error(f"手動寫入試算表失敗：{e}")
+
     if is_case:
         st.error(f"🚨 【符合收案條件】感染分類：{ensure_str(result.get('case_type', '未分類'))}")
         st.markdown(f"**照護相關判定：** {'機構內感染' if result.get('is_healthcare_associated') else '非機構照護所致／院外帶入'}")
@@ -352,17 +406,18 @@ if st.session_state.audit_result is not None:
 
     with st.form("supplemental_form"):
         supplemental_input = st.text_area(
-            "補充護理觀察、床邊快篩或用藥異動紀錄（填寫後將同步更新至雲端資料庫並重新判定）",
+            "補充護理觀察、床邊快篩或用藥異動紀錄",
             placeholder="例如：已核對給藥紀錄，近一週無調整軟便劑；剛執行床邊尿液試紙顯示 WBC 3+、Nitrite 陽性...",
             height=100
         )
-        resubmit_btn = st.form_submit_button("🔄 寫入補充資料並重新進行感管判決", type="secondary", use_container_width=True)
+        btn_label = "🔄 重新進行感管判決（僅更新畫面，不寫入資料庫）" if st.session_state.skip_db_sync else "🔄 寫入補充資料並重新進行感管判決"
+        resubmit_btn = st.form_submit_button(btn_label, type="secondary", use_container_width=True)
 
     if resubmit_btn:
         if not supplemental_input.strip():
             st.warning("請先在上方欄位輸入要補充的資料再送出！")
         else:
-            with st.spinner("正在結合補充資料進行二次精準審核，並同步更新資料庫..."):
+            with st.spinner("正在結合補充資料進行二次精準審核..."):
                 payload = st.session_state.base_payload
                 combined_prompt = f"""
                 住民資訊：
@@ -379,20 +434,27 @@ if st.session_state.audit_result is not None:
                 {supplemental_input.strip()}
                 """
                 try:
-                    new_response = call_gemini_fast(combined_prompt)
+                    new_response, new_congestion = call_gemini_with_congestion_check(combined_prompt)
                     new_result = parse_ai_json(new_response.text)
 
                     st.session_state.audit_result = new_result
+                    st.session_state.last_supplemental = supplemental_input.strip()
+                    if new_congestion:
+                        st.session_state.skip_db_sync = True
 
-                    updated_row = build_log_row(payload, new_result, supplemental_text=supplemental_input)
-                    row_idx = st.session_state.current_row_idx
-                    if row_idx:
-                        sheet_logs.update(range_name=f"A{row_idx}:O{row_idx}", values=[updated_row])
+                    # 只有在非壅塞模式下才同步更新試算表
+                    if not st.session_state.skip_db_sync:
+                        updated_row = build_log_row(payload, new_result, supplemental_text=supplemental_input)
+                        row_idx = st.session_state.current_row_idx
+                        if row_idx:
+                            sheet_logs.update(range_name=f"A{row_idx}:O{row_idx}", values=[updated_row])
+                        else:
+                            sheet_logs.append_row(updated_row)
+                        st.toast("✅ 補充資料已同步覆寫至試算表，判決結果已更新！")
                     else:
-                        sheet_logs.append_row(updated_row)
+                        st.toast("✅ 二次判決已更新於畫面（因雲端壅塞，略過資料庫寫入）！")
 
-                    st.toast("✅ 補充資料已同步覆寫至試算表，判決結果已更新！")
                     st.rerun()
 
                 except Exception as e:
-                    st.error(f"二次審核或更新資料庫時發生錯誤：{e}")
+                    st.error(f"二次審核過程發生錯誤：{e}")
