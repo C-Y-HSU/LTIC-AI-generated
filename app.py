@@ -3,15 +3,24 @@ import google.generativeai as genai
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import json
+import time
 from datetime import datetime
 
 # ==================== 頁面設定 ====================
 st.set_page_config(page_title="長照機構感管監測系統", layout="wide", page_icon="🏥")
 
+# ==================== 初始化 Session State ====================
+if "audit_result" not in st.session_state:
+    st.session_state.audit_result = None
+if "current_row_idx" not in st.session_state:
+    st.session_state.current_row_idx = None
+if "base_payload" not in st.session_state:
+    st.session_state.base_payload = None
+
 # ==================== 連線與 API 設定 ====================
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
-SYSTEM_INSTRUCTION ="""
+SYSTEM_INSTRUCTION = """
 你是一位嚴謹的長期照護機構感染管制專家 (Infection Control Officer)。
 機構現場常態「僅有護理人員與照服員執勤，無常駐醫師」。
 請依據台灣疾管署長期照護機構機構內感染監測定義，審查通報資料與時序性，判定是否符合收案條件。
@@ -27,18 +36,21 @@ SYSTEM_INSTRUCTION ="""
    - 泌尿道：無症狀單純菌尿不收案。
    - 結膜炎：排除過敏與創傷；口腔排除牙周炎、蛀牙、疱疹。
 
-【條件分流輸出規範】
-請依據判定結果（is_case），嚴格依照以下條件填寫 JSON 欄位：
+【條件分流與精簡輸出規範】
+請依據判定結果（is_case），嚴格依照以下條件填寫 JSON 欄位，文字務必精煉扼要（避免長篇大論以提升回應速度）：
 
 - 若 is_case 為 true（確定收案）：
-  1. `possible_causes`：必須精準列出「5 個」最可能的感染原因（從住民生理退化、管路照護、無菌技術、交叉感染或環境衛生等實務機轉切入）。
-  2. `nursing_measures`：必須條列「機構護理人員與照服員可獨立執行」的護理與感管措施（嚴禁產出醫師開藥、醫囑處方等醫療端指令；需涵蓋空間隔離防護、護理技術處置、生命徵象監測與快篩、特約醫療通報與 119 送醫紅旗指標）。
-  3. `non_acceptance_reason`：填寫 `""`（空字串）。
+  1. `possible_causes`：精準列出「5 個」最可能感染原因（每點限 25 字以內，從管路照護、無菌技術、生理退化或交叉感染切入）。
+  2. `nursing_measures`：條列「機構護理與照服端可獨立執行」的措施（每點限 30 字以內；嚴禁醫師開藥處方指令；須涵蓋隔離防護、護理處置、q4h監測/快篩、特約醫師通報與 119 送醫紅旗）。
+  3. `non_acceptance_reason`：填寫 `""`。
 
 - 若 is_case 為 false（不收案）：
-  1. `non_acceptance_reason`：詳細條列「不收案原因」（明確指出欠缺哪些臨床條件、屬於哪種非感染性因素，或為何歸類為院外/住院潛伏期帶入）。
-  2. `possible_causes`：填寫 `[]`（空陣列）。
-  3. `nursing_measures`：填寫 `""`（空字串）。
+  1. `non_acceptance_reason`：條列具體「不收案原因」（每點限 30 字以內，指出欠缺條件、非感染性因素，或院外/住院潛伏期帶入）。
+  2. `possible_causes`：填寫 `[]`。
+  3. `nursing_measures`：填寫 `""`。
+
+- 無論是否收案，皆須填寫 `missing_info_suggestions`（陣列，1~3 點，每點限 25 字以內）：
+  指出「若要讓本次感管收案判決更精準，護理師還可以補充哪些臨床觀察、檢驗或用藥資訊」（例如：是否近期有調整軟便劑、住民平時基礎耳溫、有無新出現肺部囉音、尿液試紙 WBC/Nitrite 結果等）。若資料已非常完整無需補充，則回傳 `[]`。
 
 【JSON 格式要求】
 嚴格輸出純合法 JSON，結構如下：
@@ -46,16 +58,11 @@ SYSTEM_INSTRUCTION ="""
   "is_case": true 或 false,
   "case_type": "呼吸道感染-肺炎" | "呼吸道感染-類流感" | "呼吸道感染-下呼吸道" | "呼吸道感染-感冒咽喉炎" | "泌尿道感染-有導尿管" | "泌尿道感染-無導尿管" | "腸胃道感染" | "皮膚軟組織感染" | "疥瘡" | "眼耳鼻口感染" | "血流感染" | "無法解釋發燒" | "不收案",
   "is_healthcare_associated": true 或 false,
-  "detailed_reasoning": "簡明扼要總結時序審查與指引條款比對過程。",
-  "possible_causes": [
-    "原因1：...",
-    "原因2：...",
-    "原因3：...",
-    "原因4：...",
-    "原因5：..."
-  ],
+  "detailed_reasoning": "簡明扼要總結時序審查與指引條款比對（限 60 字以內）。",
+  "possible_causes": ["原因1", "原因2", "原因3", "原因4", "原因5"],
   "nursing_measures": "條列護理端可執行的防護與照護措施（僅收案時填寫）",
-  "non_acceptance_reason": "條列具體不收案原因（僅不收案時填寫）"
+  "non_acceptance_reason": "條列具體不收案原因（僅不收案時填寫）",
+  "missing_info_suggestions": ["建議補充資訊1", "建議補充資訊2"]
 }
 """
 
@@ -77,6 +84,73 @@ try:
 except Exception as e:
     st.error(f"Google 試算表連線失敗，請檢查 secrets 設定與共用權限：{e}")
     st.stop()
+
+# 防逾時自動重試函式
+def call_gemini_fast(prompt_text, max_retries=2):
+    for attempt in range(max_retries):
+        try:
+            return model.generate_content(
+                prompt_text,
+                generation_config={
+                    "response_mime_type": "application/json",
+                    "thinking_config": {"thinking_budget": 0}
+                },
+                request_options={"timeout": 60}
+            )
+        except Exception as e:
+            err_msg = str(e)
+            if "thinking_config" in err_msg or "Unknown field" in err_msg:
+                return model.generate_content(
+                    prompt_text,
+                    generation_config={"response_mime_type": "application/json"},
+                    request_options={"timeout": 60}
+                )
+            if "504" in err_msg and attempt < max_retries - 1:
+                time.sleep(2)
+                continue
+            raise e
+
+def parse_ai_json(raw_text):
+    clean = raw_text.strip()
+    if clean.startswith("```"):
+        clean = clean.strip("`")
+        if clean.startswith("json"):
+            clean = clean[4:].strip()
+    return json.loads(clean)
+
+def build_log_row(payload, result, supplemental_text=""):
+    is_case = result.get("is_case", False)
+    causes = result.get("possible_causes", [])
+    
+    # 將補充紀錄合併進病程欄位，完整留存軌跡
+    full_note = payload["clinical_note"]
+    if supplemental_text.strip():
+        full_note += f"\n\n【二次補充資料 ({datetime.now().strftime('%H:%M')})】：{supplemental_text.strip()}"
+
+    if is_case:
+        sheet_reasoning = result.get("detailed_reasoning", "") + "\n\n【可能感染原因】\n" + "\n".join(causes)
+        sheet_actions = result.get("nursing_measures", "")
+    else:
+        sheet_reasoning = result.get("non_acceptance_reason") or result.get("detailed_reasoning", "")
+        sheet_actions = "不收案（維持常規照護與症狀觀察）"
+
+    return [
+        payload["timestamp"],
+        payload["bed_num"],
+        payload["name"],
+        payload["catheter_status"],
+        payload["has_recent_adm"],
+        payload["onset_date"],
+        payload["body_temp"],
+        payload["symptoms_str"],
+        full_note,
+        "收案" if is_case else "不收案",
+        result.get("case_type", "不收案") if is_case else "不收案",
+        "是" if result.get("is_healthcare_associated") else "否",
+        sheet_reasoning,
+        sheet_actions,
+        "待複核"
+    ]
 
 # ==================== 護理站端通報介面 ====================
 st.title("🏥 護理站感染管制通報與智慧收案系統")
@@ -140,138 +214,64 @@ with col_right:
 
 submit_btn = st.button("送出並執行感管收案審核", type="primary", use_container_width=True)
 
-# ==================== 3. 判定與存檔（加入動態進度條） ====================
+# ==================== 3. 初次判定與存檔 ====================
 if submit_btn:
     if not bed_num.strip() or not name.strip() or not clinical_note.strip():
         st.error("請務必完整填寫：床號、住民姓名以及護理病程經過！")
     else:
-        # 建立進度條元件與狀態文字容器
         progress_bar = st.progress(0)
         status_text = st.empty()
 
+        payload = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "bed_num": bed_num.strip(),
+            "name": name.strip(),
+            "catheter_status": catheter_status,
+            "has_recent_adm": has_recent_adm,
+            "onset_date": str(onset_date),
+            "body_temp": body_temp,
+            "symptoms_str": ", ".join(symptoms) if symptoms else "未特別勾選，詳見病程",
+            "clinical_note": clinical_note.strip()
+        }
+
         prompt_content = f"""
         住民資訊：
-        - 床號：{bed_num}
-        - 姓名：{name}
-        - 導尿管留置狀態：{catheter_status}
-        - 近期出入院狀況：{has_recent_adm}
-        - 症狀發生日：{onset_date}
-        - 體溫：{body_temp} ℃
-        - 勾選症狀：{", ".join(symptoms) if symptoms else "未特別勾選，詳見病程"}
-        - 護理病程記錄：{clinical_note}
+        - 床號：{payload['bed_num']}
+        - 姓名：{payload['name']}
+        - 導尿管留置狀態：{payload['catheter_status']}
+        - 近期出入院狀況：{payload['has_recent_adm']}
+        - 症狀發生日：{payload['onset_date']}
+        - 體溫：{payload['body_temp']} ℃
+        - 勾選症狀：{payload['symptoms_str']}
+        - 護理病程記錄：{payload['clinical_note']}
         """
 
         try:
-            # 階段 1：組裝通報資料
-            status_text.info("【1/4】整理通報資訊與時序資料...")
-            progress_bar.progress(25)
+            status_text.info("【1/3】感管 AI 引擎極速審核中（比對潛伏期、時序與非感染因素）...")
+            progress_bar.progress(40)
 
-            # 階段 2：呼叫 Gemini API 進行感管審核
-            status_text.info("【2/4】感管 AI 引擎審核中：比對潛伏期、時序性與排除非感染病理...")
-            progress_bar.progress(50)
+            response = call_gemini_fast(prompt_content)
 
-            response = model.generate_content(
-                prompt_content,
-                generation_config={"response_mime_type": "application/json"}
-            )
+            status_text.info("【2/3】解析審核結果與資料缺漏評估...")
+            progress_bar.progress(80)
 
-            raw_text = response.text.strip()
-            if raw_text.startswith("```"):
-                raw_text = raw_text.strip("`")
-                if raw_text.startswith("json"):
-                    raw_text = raw_text[4:].strip()
+            result = parse_ai_json(response.text)
 
-            result = json.loads(raw_text)
+            # 存入 session_state 以維持二次補件狀態
+            st.session_state.audit_result = result
+            st.session_state.base_payload = payload
 
-            # 階段 3：解析判定結果
-            status_text.info("【3/4】審核完成，解析判定條款與護理處置指引...")
-            progress_bar.progress(75)
+            # 寫入 Google Sheets 並記錄寫入的行號
+            status_text.info("【3/3】同步寫入雲端試算表...")
+            log_row = build_log_row(payload, result)
+            sheet_logs.append_row(log_row)
+            
+            # 取得剛剛寫入的那一列行號（總列數即為最新一列）
+            st.session_state.current_row_idx = len(sheet_logs.get_all_values())
 
-            # 階段 4：寫入 Google Sheets
-            status_text.info("【4/4】正在同步存入 Google 雲端試算表資料庫...")
-            log_entry = [
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                bed_num,
-                name,
-                catheter_status,
-                has_recent_adm,
-                str(onset_date),
-                body_temp,
-                ", ".join(symptoms),
-                clinical_note,
-                "收案" if result.get("is_case") else "不收案",
-                result.get("case_type", "未分類"),
-                "是" if result.get("is_healthcare_associated") else "否",
-                result.get("detailed_reasoning", ""),
-                result.get("recommended_actions", ""),
-                "待複核"
-            ]
-            sheet_logs.append_row(log_entry)
-
-            # 完成：進度條拉滿並清除過渡提示
-            progress_bar.progress(100)
             status_text.empty()
             progress_bar.empty()
-
-            # 畫面結果展示（依收案與否分流顯示）
-            st.divider()
-            is_case = result.get("is_case", False)
-
-            if is_case:
-                st.error(f"🚨 【符合收案條件】感染分類：{result.get('case_type', '未分類')}")
-                st.markdown(f"**照護相關判定：** {'機構內感染' if result.get('is_healthcare_associated') else '非機構照護所致／院外帶入'}")
-                st.markdown(f"**審核條款摘要：**\n{result.get('detailed_reasoning', '')}")
-
-                col_cause, col_care = st.columns(2, gap="medium")
-                with col_cause:
-                    st.subheader("🔍 5 個可能感染原因")
-                    causes = result.get("possible_causes", [])
-                    if causes:
-                        for idx, cause in enumerate(causes, 1):
-                            st.markdown(f"**{idx}.** {cause}")
-                    else:
-                        st.write("無額外列出原因")
-
-                with col_care:
-                    st.subheader("📋 機構護理端可執行措施")
-                    st.warning(result.get("nursing_measures", "請依機構感管標準作業程序執行隔離與監測。"))
-
-                # 組合寫入試算表的文字欄位
-                sheet_reasoning = result.get("detailed_reasoning", "") + "\n\n【可能感染原因】\n" + "\n".join(causes)
-                sheet_actions = result.get("nursing_measures", "")
-
-            else:
-                st.info("📋 【未符合收案標準】判定結果：不收案")
-                st.markdown(f"**照護相關判定：** {'機構內感染（未達定義門檻）' if result.get('is_healthcare_associated') else '非機構照護所致／院外帶入'}")
-                
-                st.subheader("❌ 不收案原因說明")
-                non_acc_reason = result.get("non_acceptance_reason") or result.get("detailed_reasoning", "")
-                st.success(non_acc_reason)
-
-                # 組合寫入試算表的文字欄位
-                sheet_reasoning = non_acc_reason
-                sheet_actions = "不收案（維持常規照護與症狀觀察）"
-
-            # 寫入 Google Sheets (Surveillance_Logs，維持原有 15 欄對應)
-            log_entry = [
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                bed_num,
-                name,
-                catheter_status,
-                has_recent_adm,
-                str(onset_date),
-                body_temp,
-                ", ".join(symptoms),
-                clinical_note,
-                "收案" if is_case else "不收案",
-                result.get("case_type", "不收案") if is_case else "不收案",
-                "是" if result.get("is_healthcare_associated") else "否",
-                sheet_reasoning,
-                sheet_actions,
-                "待複核"
-            ]
-            sheet_logs.append_row(log_entry)
-            st.success("✅ 通報記錄與判定結果已成功同步存入 Google 試算表！")
+            st.toast("✅ 初次審核完成並已存入 Google 試算表！")
 
         except json.JSONDecodeError:
             status_text.empty()
@@ -282,3 +282,95 @@ if submit_btn:
             status_text.empty()
             progress_bar.empty()
             st.error(f"執行或寫入試算表時發生錯誤：{e}")
+
+# ==================== 4. 顯示判定結果與「二次補充資料重審區」 ====================
+if st.session_state.audit_result is not None:
+    result = st.session_state.audit_result
+    is_case = result.get("is_case", False)
+
+    st.divider()
+    if is_case:
+        st.error(f"🚨 【符合收案條件】感染分類：{result.get('case_type', '未分類')}")
+        st.markdown(f"**照護相關判定：** {'機構內感染' if result.get('is_healthcare_associated') else '非機構照護所致／院外帶入'}")
+        st.markdown(f"**審核條款摘要：** {result.get('detailed_reasoning', '')}")
+
+        col_cause, col_care = st.columns(2, gap="medium")
+        with col_cause:
+            st.subheader("🔍 5 個可能感染原因")
+            causes = result.get("possible_causes", [])
+            if causes:
+                for idx, cause in enumerate(causes, 1):
+                    st.markdown(f"**{idx}.** {cause}")
+            else:
+                st.write("無額外列出原因")
+
+        with col_care:
+            st.subheader("📋 機構護理端可執行措施")
+            st.warning(result.get("nursing_measures", "請依機構感管標準作業程序執行隔離與監測。"))
+
+    else:
+        st.info("📋 【未符合收案標準】判定結果：不收案")
+        st.markdown(f"**照護相關判定：** {'機構內感染（未達定義門檻）' if result.get('is_healthcare_associated') else '非機構照護所致／院外帶入'}")
+        
+        st.subheader("❌ 不收案原因說明")
+        non_acc_reason = result.get("non_acceptance_reason") or result.get("detailed_reasoning", "")
+        st.success(non_acc_reason)
+
+    # ----- 互動補件回饋區 -----
+    st.divider()
+    st.subheader("💡 AI 感管員精準判決建議：可再補充之臨床資訊")
+    
+    suggestions = result.get("missing_info_suggestions", [])
+    if suggestions:
+        st.info("為讓本次收案判決更精準，建議護理站可進一步確認並補充以下項目：\n" + "\n".join([f"- **{s}**" for s in suggestions]))
+    else:
+        st.caption("目前提供的臨床資訊已相當完整。若仍有新進檢驗或觀察變化，仍可於下方補充重審。")
+
+    with st.form("supplemental_form"):
+        supplemental_input = st.text_area(
+            "補充臨床觀察、檢驗數據或用藥紀錄（填寫後將同步更新至雲端資料庫並重新判定）",
+            placeholder="例如：已詢問家屬並核對藥單，近一週無使用軟便劑；剛執行尿液試紙檢查顯示 WBC 3+、Nitrite 陽性...",
+            height=100
+        )
+        resubmit_btn = st.form_submit_button("🔄 寫入補充資料並重新進行感管判決", type="secondary", use_container_width=True)
+
+    if resubmit_btn:
+        if not supplemental_input.strip():
+            st.warning("請先在上方欄位輸入要補充的資料再送出！")
+        else:
+            with st.spinner("正在結合補充資料進行二次精準審核，並同步更新資料庫..."):
+                payload = st.session_state.base_payload
+                combined_prompt = f"""
+                住民資訊：
+                - 床號：{payload['bed_num']}
+                - 姓名：{payload['name']}
+                - 導尿管留置狀態：{payload['catheter_status']}
+                - 近期出入院狀況：{payload['has_recent_adm']}
+                - 症狀發生日：{payload['onset_date']}
+                - 體溫：{payload['body_temp']} ℃
+                - 勾選症狀：{payload['symptoms_str']}
+                - 初次護理病程記錄：{payload['clinical_note']}
+                
+                【護理站二次補充資料（請以此最新資訊為準重新判決）】：
+                {supplemental_input.strip()}
+                """
+                try:
+                    new_response = call_gemini_fast(combined_prompt)
+                    new_result = parse_ai_json(new_response.text)
+
+                    # 更新 session_state
+                    st.session_state.audit_result = new_result
+
+                    # 直接覆寫更新 Google Sheets 同一列（A欄到O欄共15欄）
+                    updated_row = build_log_row(payload, new_result, supplemental_text=supplemental_input)
+                    row_idx = st.session_state.current_row_idx
+                    if row_idx:
+                        sheet_logs.update(range_name=f"A{row_idx}:O{row_idx}", values=[updated_row])
+                    else:
+                        sheet_logs.append_row(updated_row)
+
+                    st.toast("✅ 補充資料已同步覆寫至試算表，判決結果已更新！")
+                    st.rerun()  # 立即刷新畫面呈現最新判決
+
+                except Exception as e:
+                    st.error(f"二次審核或更新資料庫時發生錯誤：{e}")
