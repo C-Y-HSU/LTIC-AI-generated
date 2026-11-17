@@ -67,7 +67,7 @@ SYSTEM_INSTRUCTION = """
 """
 
 model = genai.GenerativeModel(
-    model_name="gemini-3.8-flash",
+    model_name="gemini-3.5-flash-lite",
     system_instruction=SYSTEM_INSTRUCTION
 )
 
