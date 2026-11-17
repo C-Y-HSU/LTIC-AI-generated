@@ -18,8 +18,8 @@ if "base_payload" not in st.session_state:
     st.session_state.base_payload = None
 if "skip_db_sync" not in st.session_state:
     st.session_state.skip_db_sync = False  # 標記是否因雲端壅塞而改為「僅介面呈現」
-if "last_supplemental" not in st.session_state:
-    st.session_state.last_supplemental = ""
+if "is_ic_mode_run" not in st.session_state:
+    st.session_state.is_ic_mode_run = False  # 標記該次執行是否為「感管人員模式」
 
 # ==================== 連線與 API 設定 ====================
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
@@ -115,7 +115,7 @@ def ensure_str(val):
 def call_gemini_with_congestion_check(prompt_text, max_retries=3):
     """
     呼叫 Gemini 並回傳 (response, had_congestion)
-    若過程中曾發生 504/503 壅塞重試，had_congestion 會標記為 True，後續自動改為僅介面呈現以減輕連線負擔
+    若過程中曾發生 504/503 壅塞重試，had_congestion 會標記為 True
     """
     had_congestion = False
     for attempt in range(max_retries):
@@ -143,7 +143,7 @@ def call_gemini_with_congestion_check(prompt_text, max_retries=3):
                     err_msg = str(inner_e)
 
             if ("504" in err_msg or "503" in err_msg or "Deadline" in err_msg):
-                had_congestion = True  # 標記雲端發生壅塞
+                had_congestion = True
                 if attempt < max_retries - 1:
                     time.sleep(2)
                     continue
@@ -206,6 +206,15 @@ def build_log_row(payload, result, supplemental_text=""):
 st.title("🏥 護理站感染管制通報與智慧收案系統")
 st.caption("依據長期照護機構感染監測指引進行即時判定與雲端登錄（老人福利機構護理端專用）")
 
+# 頂部模式切換橫幅
+ic_mode = st.toggle(
+    "🕵️ 啟用「感管人員模式」（純介面快速試算／演練，不寫入 Google 試算表）",
+    value=False,
+    help="開啟後，所有初步審核與二次補件僅直接呈現於畫面，不會寫入資料庫，可大幅減輕連線負擔並避免產生測試紀錄。"
+)
+if ic_mode:
+    st.info("🕵️ **目前處於【感管人員模式】**：本次評估結果將直接呈現在下方介面，**不會寫入 Google 試算表資料庫**。")
+
 col_left, col_right = st.columns([1, 1], gap="medium")
 
 with col_left:
@@ -260,7 +269,8 @@ with col_right:
         height=140
     )
 
-submit_btn = st.button("送出並執行感管收案審核", type="primary", use_container_width=True)
+btn_text = "🕵️ 執行感管人員內部審核（不寫入資料庫）" if ic_mode else "送出並執行感管收案審核"
+submit_btn = st.button(btn_text, type="primary", use_container_width=True)
 
 # ==================== 3. 初次判定與智慧分流存檔 ====================
 if submit_btn:
@@ -270,10 +280,10 @@ if submit_btn:
         progress_bar = st.progress(0)
         status_text = st.empty()
 
-        # 每次新案件送出時重置壅塞標記
+        # 初始化本次執行狀態
         st.session_state.skip_db_sync = False
         st.session_state.current_row_idx = None
-        st.session_state.last_supplemental = ""
+        st.session_state.is_ic_mode_run = ic_mode
 
         payload = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -314,15 +324,17 @@ if submit_btn:
             st.session_state.base_payload = payload
             st.session_state.skip_db_sync = had_congestion
 
-            # 只有在「沒有發生雲端壅塞重試」的順暢狀態下，才自動寫入試算表
-            if not had_congestion:
+            # 判斷是否需要寫入資料庫：1. 非感管人員模式  2. 且沒有發生雲端壅塞
+            if not ic_mode and not had_congestion:
                 status_text.info("【3/3】連線順暢，同步寫入雲端試算表...")
                 log_row = build_log_row(payload, result)
                 sheet_logs.append_row(log_row)
                 st.session_state.current_row_idx = len(sheet_logs.get_all_values())
                 st.toast("✅ 初次審核完成並已存入 Google 試算表！")
+            elif ic_mode:
+                st.toast("🕵️ 感管人員模式：審核完成，結果已直接呈現於介面（未寫入資料庫）。")
             else:
-                st.toast("⚠️ 偵測到 Google 雲端尖峰壅塞，已啟動「僅介面呈現模式」以減輕連線負擔！")
+                st.toast("⚠️ 雲端尖峰壅塞，已略過資料庫寫入，請直接截圖傳給感管員！")
 
             status_text.empty()
             progress_bar.empty()
@@ -340,32 +352,25 @@ if submit_btn:
 # ==================== 4. 顯示判定結果與「二次補充資料重審區」 ====================
 if st.session_state.audit_result is not None:
     result = st.session_state.audit_result
+    payload = st.session_state.base_payload
     is_case = result.get("is_case", False)
 
     st.divider()
 
-    # 若處於「僅介面呈現模式」，顯示明確提醒與手動補存按鈕
-    if st.session_state.skip_db_sync:
-        st.warning("⚠️ **目前為「僅介面呈現模式」**：因偵測到 Google 雲端尖峰壅塞（曾發生 504 逾時重試），為避免資料庫連線負擔與寫入異常，本次與後續二次補件結果將**只呈現在畫面上，不自動寫入 Google 試算表**。")
-        if st.button("📥 網路已恢復順暢，手動將目前這筆結果補存至 Google 試算表", use_container_width=True):
-            try:
-                with st.spinner("正在寫入 Google 試算表..."):
-                    manual_row = build_log_row(
-                        st.session_state.base_payload,
-                        result,
-                        supplemental_text=st.session_state.last_supplemental
-                    )
-                    sheet_logs.append_row(manual_row)
-                    st.session_state.current_row_idx = len(sheet_logs.get_all_values())
-                    st.session_state.skip_db_sync = False
-                    st.success("✅ 已成功手動補存至 Google 試算表！")
-                    st.rerun()
-            except Exception as e:
-                st.error(f"手動寫入試算表失敗：{e}")
+    # ----- 狀態橫幅與截圖提醒 -----
+    if st.session_state.is_ic_mode_run:
+        st.info(f"🕵️ **【感管人員模式輸出】** 評估對象：**{payload['bed_num']} {payload['name']}**（此筆資料未寫入資料庫）")
+    elif st.session_state.skip_db_sync:
+        st.warning(
+            f"📸 **【雲端尖峰壅塞提醒 — 請直接截圖回傳】**\n\n"
+            f"目前 Google 雲端伺服器正處於尖峰壅塞狀態（曾發生 504 逾時重試）。為減輕連線負擔，**本次與後續二次補件結果皆不再寫入資料庫**。\n\n"
+            f"👉 **請護理同仁直接將下方完整判決畫面（含床號 `{payload['bed_num']} {payload['name']}`、收案結果與護理措施）截圖，透過通訊軟體（LINE／機構群組）傳送給感管人員留存即可！**"
+        )
 
+    # ----- 判決結果卡片（包含住民識別資訊，方便截圖一目了然） -----
     if is_case:
-        st.error(f"🚨 【符合收案條件】感染分類：{ensure_str(result.get('case_type', '未分類'))}")
-        st.markdown(f"**照護相關判定：** {'機構內感染' if result.get('is_healthcare_associated') else '非機構照護所致／院外帶入'}")
+        st.error(f"🚨 【符合收案條件】對象：{payload['bed_num']} {payload['name']}｜感染分類：{ensure_str(result.get('case_type', '未分類'))}")
+        st.markdown(f"**照護相關判定：** {'機構內感染' if result.get('is_healthcare_associated') else '非機構照護所致／院外帶入'} ｜ **通報時間：** {payload['timestamp']}")
         st.markdown(f"**審核條款摘要：** {ensure_str(result.get('detailed_reasoning', ''))}")
 
         col_cause, col_care = st.columns(2, gap="medium")
@@ -385,8 +390,8 @@ if st.session_state.audit_result is not None:
             st.warning(ensure_str(result.get("nursing_measures", "請依機構感管標準作業程序執行隔離與護理監測。")))
 
     else:
-        st.info("📋 【未符合收案標準】判定結果：不收案")
-        st.markdown(f"**照護相關判定：** {'機構內感染（未達定義門檻）' if result.get('is_healthcare_associated') else '非機構照護所致／院外帶入'}")
+        st.info(f"📋 【未符合收案標準】對象：{payload['bed_num']} {payload['name']}｜判定結果：不收案")
+        st.markdown(f"**照護相關判定：** {'機構內感染（未達定義門檻）' if result.get('is_healthcare_associated') else '非機構照護所致／院外帶入'} ｜ **通報時間：** {payload['timestamp']}")
         
         st.subheader("❌ 不收案原因說明")
         non_acc_reason = ensure_str(result.get("non_acceptance_reason") or result.get("detailed_reasoning", ""))
@@ -398,7 +403,7 @@ if st.session_state.audit_result is not None:
     
     suggestions = result.get("missing_info_suggestions", [])
     if isinstance(suggestions, list) and suggestions:
-        st.info("為讓本次收案判決更精準，建議護理站可進一步確認並補充以下項目：\n" + "\n".join([f"- **{s}**" for s in suggestions]))
+        st.info("為讓本次收案判決更精準，建議可進一步確認並補充以下項目：\n" + "\n".join([f"- **{s}**" for s in suggestions]))
     elif suggestions:
         st.info(f"建議補充項目：{ensure_str(suggestions)}")
     else:
@@ -410,7 +415,8 @@ if st.session_state.audit_result is not None:
             placeholder="例如：已核對給藥紀錄，近一週無調整軟便劑；剛執行床邊尿液試紙顯示 WBC 3+、Nitrite 陽性...",
             height=100
         )
-        btn_label = "🔄 重新進行感管判決（僅更新畫面，不寫入資料庫）" if st.session_state.skip_db_sync else "🔄 寫入補充資料並重新進行感管判決"
+        no_db = st.session_state.is_ic_mode_run or st.session_state.skip_db_sync
+        btn_label = "🔄 重新進行感管判決（僅更新畫面，不寫入資料庫）" if no_db else "🔄 寫入補充資料並重新進行感管判決"
         resubmit_btn = st.form_submit_button(btn_label, type="secondary", use_container_width=True)
 
     if resubmit_btn:
@@ -418,7 +424,6 @@ if st.session_state.audit_result is not None:
             st.warning("請先在上方欄位輸入要補充的資料再送出！")
         else:
             with st.spinner("正在結合補充資料進行二次精準審核..."):
-                payload = st.session_state.base_payload
                 combined_prompt = f"""
                 住民資訊：
                 - 床號：{payload['bed_num']}
@@ -438,12 +443,11 @@ if st.session_state.audit_result is not None:
                     new_result = parse_ai_json(new_response.text)
 
                     st.session_state.audit_result = new_result
-                    st.session_state.last_supplemental = supplemental_input.strip()
                     if new_congestion:
                         st.session_state.skip_db_sync = True
 
-                    # 只有在非壅塞模式下才同步更新試算表
-                    if not st.session_state.skip_db_sync:
+                    # 只有在「非感管模式」且「非壅塞模式」下才同步更新試算表
+                    if not st.session_state.is_ic_mode_run and not st.session_state.skip_db_sync:
                         updated_row = build_log_row(payload, new_result, supplemental_text=supplemental_input)
                         row_idx = st.session_state.current_row_idx
                         if row_idx:
@@ -451,8 +455,10 @@ if st.session_state.audit_result is not None:
                         else:
                             sheet_logs.append_row(updated_row)
                         st.toast("✅ 補充資料已同步覆寫至試算表，判決結果已更新！")
+                    elif st.session_state.is_ic_mode_run:
+                        st.toast("🕵️ 感管人員模式：二次判決已更新於畫面！")
                     else:
-                        st.toast("✅ 二次判決已更新於畫面（因雲端壅塞，略過資料庫寫入）！")
+                        st.toast("📸 雲端壅塞中，判決已更新於畫面，請直接截圖傳給感管員！")
 
                     st.rerun()
 
