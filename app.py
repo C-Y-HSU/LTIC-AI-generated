@@ -66,6 +66,7 @@ SYSTEM_INSTRUCTION = """
 }
 """
 
+# 採用 gemini-3.5-flash-lite（反應極快且每日免費額度最寬鬆）
 model = genai.GenerativeModel(
     model_name="gemini-3.5-flash-lite",
     system_instruction=SYSTEM_INSTRUCTION
@@ -85,26 +86,23 @@ except Exception as e:
     st.error(f"Google 試算表連線失敗，請檢查 secrets 設定與共用權限：{e}")
     st.stop()
 
-# 防逾時自動重試函式
+# ==================== 輔助與防呆函式 ====================
+def ensure_str(val):
+    """防呆輔助函式：確保無論 AI 回傳字串或陣列，都能安全轉為純文字以寫入 Google Sheets"""
+    if isinstance(val, list):
+        return "\n".join([str(item) for item in val])
+    return str(val) if val is not None else ""
+
 def call_gemini_fast(prompt_text, max_retries=2):
     for attempt in range(max_retries):
         try:
             return model.generate_content(
                 prompt_text,
-                generation_config={
-                    "response_mime_type": "application/json",
-                    "thinking_config": {"thinking_budget": 0}
-                },
+                generation_config={"response_mime_type": "application/json"},
                 request_options={"timeout": 60}
             )
         except Exception as e:
             err_msg = str(e)
-            if "thinking_config" in err_msg or "Unknown field" in err_msg:
-                return model.generate_content(
-                    prompt_text,
-                    generation_config={"response_mime_type": "application/json"},
-                    request_options={"timeout": 60}
-                )
             if "504" in err_msg and attempt < max_retries - 1:
                 time.sleep(2)
                 continue
@@ -121,17 +119,22 @@ def parse_ai_json(raw_text):
 def build_log_row(payload, result, supplemental_text=""):
     is_case = result.get("is_case", False)
     causes = result.get("possible_causes", [])
+    if not isinstance(causes, list):
+        causes = [str(causes)] if causes else []
     
-    # 將補充紀錄合併進病程欄位，完整留存軌跡
+    # 將二次補充紀錄合併進病程欄位，完整留存軌跡
     full_note = payload["clinical_note"]
     if supplemental_text.strip():
         full_note += f"\n\n【二次補充資料 ({datetime.now().strftime('%H:%M')})】：{supplemental_text.strip()}"
 
     if is_case:
-        sheet_reasoning = result.get("detailed_reasoning", "") + "\n\n【可能感染原因】\n" + "\n".join(causes)
-        sheet_actions = result.get("nursing_measures", "")
+        reasoning_str = ensure_str(result.get("detailed_reasoning", ""))
+        causes_str = "\n".join([str(c) for c in causes])
+        sheet_reasoning = f"{reasoning_str}\n\n【可能感染原因】\n{causes_str}"
+        sheet_actions = ensure_str(result.get("nursing_measures", ""))
     else:
-        sheet_reasoning = result.get("non_acceptance_reason") or result.get("detailed_reasoning", "")
+        raw_non_acc = result.get("non_acceptance_reason") or result.get("detailed_reasoning", "")
+        sheet_reasoning = ensure_str(raw_non_acc)
         sheet_actions = "不收案（維持常規照護與症狀觀察）"
 
     return [
@@ -145,7 +148,7 @@ def build_log_row(payload, result, supplemental_text=""):
         payload["symptoms_str"],
         full_note,
         "收案" if is_case else "不收案",
-        result.get("case_type", "不收案") if is_case else "不收案",
+        ensure_str(result.get("case_type", "不收案")) if is_case else "不收案",
         "是" if result.get("is_healthcare_associated") else "否",
         sheet_reasoning,
         sheet_actions,
@@ -266,7 +269,7 @@ if submit_btn:
             log_row = build_log_row(payload, result)
             sheet_logs.append_row(log_row)
             
-            # 取得剛剛寫入的那一列行號（總列數即為最新一列）
+            # 取得剛剛寫入的那一列行號
             st.session_state.current_row_idx = len(sheet_logs.get_all_values())
 
             status_text.empty()
@@ -290,30 +293,32 @@ if st.session_state.audit_result is not None:
 
     st.divider()
     if is_case:
-        st.error(f"🚨 【符合收案條件】感染分類：{result.get('case_type', '未分類')}")
+        st.error(f"🚨 【符合收案條件】感染分類：{ensure_str(result.get('case_type', '未分類'))}")
         st.markdown(f"**照護相關判定：** {'機構內感染' if result.get('is_healthcare_associated') else '非機構照護所致／院外帶入'}")
-        st.markdown(f"**審核條款摘要：** {result.get('detailed_reasoning', '')}")
+        st.markdown(f"**審核條款摘要：** {ensure_str(result.get('detailed_reasoning', ''))}")
 
         col_cause, col_care = st.columns(2, gap="medium")
         with col_cause:
             st.subheader("🔍 5 個可能感染原因")
             causes = result.get("possible_causes", [])
-            if causes:
+            if isinstance(causes, list) and causes:
                 for idx, cause in enumerate(causes, 1):
                     st.markdown(f"**{idx}.** {cause}")
+            elif causes:
+                st.write(ensure_str(causes))
             else:
                 st.write("無額外列出原因")
 
         with col_care:
             st.subheader("📋 機構護理端可執行措施")
-            st.warning(result.get("nursing_measures", "請依機構感管標準作業程序執行隔離與監測。"))
+            st.warning(ensure_str(result.get("nursing_measures", "請依機構感管標準作業程序執行隔離與監測。")))
 
     else:
         st.info("📋 【未符合收案標準】判定結果：不收案")
         st.markdown(f"**照護相關判定：** {'機構內感染（未達定義門檻）' if result.get('is_healthcare_associated') else '非機構照護所致／院外帶入'}")
         
         st.subheader("❌ 不收案原因說明")
-        non_acc_reason = result.get("non_acceptance_reason") or result.get("detailed_reasoning", "")
+        non_acc_reason = ensure_str(result.get("non_acceptance_reason") or result.get("detailed_reasoning", ""))
         st.success(non_acc_reason)
 
     # ----- 互動補件回饋區 -----
@@ -321,8 +326,10 @@ if st.session_state.audit_result is not None:
     st.subheader("💡 AI 感管員精準判決建議：可再補充之臨床資訊")
     
     suggestions = result.get("missing_info_suggestions", [])
-    if suggestions:
+    if isinstance(suggestions, list) and suggestions:
         st.info("為讓本次收案判決更精準，建議護理站可進一步確認並補充以下項目：\n" + "\n".join([f"- **{s}**" for s in suggestions]))
+    elif suggestions:
+        st.info(f"建議補充項目：{ensure_str(suggestions)}")
     else:
         st.caption("目前提供的臨床資訊已相當完整。若仍有新進檢驗或觀察變化，仍可於下方補充重審。")
 
@@ -370,7 +377,7 @@ if st.session_state.audit_result is not None:
                         sheet_logs.append_row(updated_row)
 
                     st.toast("✅ 補充資料已同步覆寫至試算表，判決結果已更新！")
-                    st.rerun()  # 立即刷新畫面呈現最新判決
+                    st.rerun()
 
                 except Exception as e:
                     st.error(f"二次審核或更新資料庫時發生錯誤：{e}")
