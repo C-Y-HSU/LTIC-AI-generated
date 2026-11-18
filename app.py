@@ -7,7 +7,7 @@ import time
 from datetime import datetime
 
 # ==================== 頁面設定 ====================
-st.set_page_config(page_title="長照機構感管監測系統", layout="wide", page_icon="🏥")
+st.set_page_config(page_title="自然敬老院機構感管系統-AI監測收案", layout="wide", page_icon="🏥")
 
 # ==================== 初始化 Session State ====================
 if "audit_result" not in st.session_state:
@@ -203,17 +203,17 @@ def build_log_row(payload, result, supplemental_text=""):
     ]
 
 # ==================== 護理站端通報介面 ====================
-st.title("🏥 護理站感染管制通報與智慧收案系統")
-st.caption("依據長期照護機構感染監測指引進行即時判定與雲端登錄（老人福利機構護理端專用）")
+st.title("🏥 自然敬老院護理站感染監測通報系統")
+st.caption("依據長期照護機構感染監測指引進行即時判定")
 
 # 頂部模式切換橫幅
 ic_mode = st.toggle(
-    "🕵️ 啟用「拍照截圖模式」（純介面快速試算／演練，如果遇到網路塞車建議開啟此選項 截圖快捷鍵:Ctrl +Alt +Shift +S）",
+    "🕵️ 啟用「拍照截圖模式」（純介面快速試算／演練，如果遇到網路塞車建議開啟此選項 截圖快捷鍵:Ctrl +Alt +Shift +S 將結果透過通訊軟體傳給感管）",
     value=False,
     help="開啟後，所有初步審核與二次補件僅直接呈現於畫面，不會寫入資料庫，可大幅減輕連線負擔並避免產生測試紀錄。"
 )
 if ic_mode:
-    st.info("🕵️ **目前處於【感管人員模式】**：本次評估結果將直接呈現在下方介面，**不會寫入 Google 試算表資料庫**。")
+    st.info("🕵️ **目前處於【感管人員模式】**：本次評估結果將直接呈現在下方介面，**不會寫入資料庫**。")
 
 col_left, col_right = st.columns([1, 1], gap="medium")
 
